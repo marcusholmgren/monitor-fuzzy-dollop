@@ -1,0 +1,26 @@
+[project]
+name = "monitor-fuzzy-dollop"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Marcus Holmgren", email = "marcus.holmgren1@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi[standard]>=0.143.0",
+    "httpx2>=2.13.1",
+    "psycopg[binary,pool]>=3.3.6",
+]
+
+[project.scripts]
+monitor-fuzzy-dollop = "monitor_fuzzy_dollop:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
