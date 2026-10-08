@@ -26,3 +26,8 @@ Experimental API for collecting IoT readings
 ```bash
   uv run pytest -v
 ```
+
+## Database Initialization
+
+- The official PostgreSQL container runs all .sql files found in /docker-entrypoint-initdb.d/ in alphabetical order during first-time database cluster initialization.
+- Because schema.sql precedes seed.sql alphabetically, the tables, constraints, and indexes are created first, followed immediately by the initial seed records.
