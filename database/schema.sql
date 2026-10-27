@@ -1,6 +1,7 @@
+-- Clean existing tables for local resets
+DROP TABLE IF EXISTS file_ingestions;
 -- schema.sql
 
--- Clean existing tables for local resets
 DROP TABLE IF EXISTS readings;
 DROP TABLE IF EXISTS sensors;
 DROP TABLE IF EXISTS houses;
@@ -53,3 +54,22 @@ CREATE INDEX idx_readings_house_keyset
 
 CREATE INDEX idx_readings_global_keyset
     ON readings (recorded_at DESC, id DESC);
+
+-- 5. File Ingestions Table
+CREATE TABLE file_ingestions (
+    id UUID PRIMARY KEY DEFAULT uuidv7(),
+    device_id UUID NOT NULL,
+    file_hash CHAR(64) NOT NULL, -- SHA-256 hex digest
+    file_path TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    original_filename VARCHAR(255) NOT NULL,
+    file_size_bytes BIGINT NOT NULL,
+    file_count INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+
+    -- Idempotency key: identical payload from the same device
+    CONSTRAINT uq_device_file_hash UNIQUE (device_id, file_hash)
+);
+
+CREATE INDEX idx_file_ingestions_lookup
+    ON file_ingestions (device_id, file_hash);

@@ -1,3 +1,4 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -5,6 +6,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:postgres@localhost:5432/monitor_fuzzy_dollop"
     min_pool_size: int = 1
     max_pool_size: int = 10
+    storage_path: Path = Path("./storage/uploads")
 
     model_config = SettingsConfigDict(
         env_file=".env",

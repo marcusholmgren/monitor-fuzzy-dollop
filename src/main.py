@@ -6,11 +6,16 @@ from src.db.pool import lifespan_pool
 from src.core.exceptions import (
     UnregisteredEntityError,
     InvalidCursorError,
+    InvalidZipFileError,
+    FileCountExceededError,
     unregistered_entity_exception_handler,
     invalid_cursor_exception_handler,
+    invalid_zip_file_exception_handler,
+    file_count_exceeded_exception_handler,
 )
 from src.api.v1.ingestion import router as ingestion_router
 from src.api.v1.readings import router as readings_router
+from src.api.v1.file_ingestion import router as file_ingestion_router
 
 
 @contextlib.asynccontextmanager
@@ -29,10 +34,13 @@ app = FastAPI(
 # Exception handlers
 app.add_exception_handler(UnregisteredEntityError, unregistered_entity_exception_handler)
 app.add_exception_handler(InvalidCursorError, invalid_cursor_exception_handler)
+app.add_exception_handler(InvalidZipFileError, invalid_zip_file_exception_handler)
+app.add_exception_handler(FileCountExceededError, file_count_exceeded_exception_handler)
 
 # Routers
 app.include_router(ingestion_router, prefix="/api/v1", tags=["Ingestion"])
 app.include_router(readings_router, prefix="/api/v1", tags=["Readings"])
+app.include_router(file_ingestion_router, prefix="/api/v1", tags=["File Ingestion"])
 
 
 @app.get("/health", tags=["Health"])

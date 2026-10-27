@@ -47,3 +47,43 @@ async def invalid_cursor_exception_handler(
             "message": str(exc),
         },
     )
+
+
+class InvalidZipFileError(DomainError):
+    """Raised when uploaded file is not a valid zip archive."""
+
+    def __init__(self, message: str = "Invalid zip file archive."):
+        self.message = message
+        super().__init__(message)
+
+
+class FileCountExceededError(DomainError):
+    """Raised when zip file does not contain between 1 and 4 files."""
+
+    def __init__(self, message: str = "Zip file must contain between 1 and 4 files."):
+        self.message = message
+        super().__init__(message)
+
+
+async def invalid_zip_file_exception_handler(
+    request: Request, exc: InvalidZipFileError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "error": "InvalidZipFileError",
+            "message": exc.message,
+        },
+    )
+
+
+async def file_count_exceeded_exception_handler(
+    request: Request, exc: FileCountExceededError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "error": "FileCountExceededError",
+            "message": exc.message,
+        },
+    )

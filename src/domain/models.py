@@ -19,3 +19,9 @@ class ReadingReadModel:
 class PaginatedReadingsResult:
     items: list[ReadingReadModel]
     next_cursor: Optional[str]
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionResult:
+    file_hash: str
+    is_duplicate: bool
