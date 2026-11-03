@@ -1,7 +1,9 @@
 """Standalone Zip File Processor Service.
 
-Simulates a sequential processing workflow for ingested Zip files
-using only the Python Standard Library.
+Queries PostgreSQL for unprocessed Zip file records in `file_ingestions`,
+simulates the processing workflow (sleep/logging), and updates the status
+to 'processed'. Adheres to the Command/Handler architectural pattern and
+exclusively uses the Python standard library.
 """
 
 from __future__ import annotations
@@ -9,12 +11,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
+
+from src.domain.commands import ProcessUnprocessedZipFilesCommand
+from src.handlers.process_zip_files import ProcessUnprocessedZipFilesHandler, UpdateFileIngestionStatusHandler
 
 
 def setup_logger(level: str = "INFO") -> logging.Logger:
@@ -33,14 +39,49 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
     return logger
 
 
+def get_db_connection(database_url: str | None = None) -> Any:
+    """Establishes and returns a database connection.
+
+    Uses `psycopg` if available, or falls back to Python standard library
+    database drivers (e.g. `sqlite3` for mock/test environments).
+    """
+    db_url = (
+        database_url
+        or os.environ.get("DATABASE_URL")
+        or "postgresql://postgres:postgres@localhost:5432/monitor_fuzzy_dollop"
+    )
+
+    if db_url.startswith("sqlite://"):
+        import sqlite3
+
+        db_path = db_url.removeprefix("sqlite://").removeprefix("/")
+        if not db_path:
+            db_path = ":memory:"
+        conn = sqlite3.connect(db_path)
+        return conn
+
+    # Attempt psycopg (standard connection)
+    try:
+        import psycopg
+
+        return psycopg.connect(db_url, autocommit=True)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to connect to database at {db_url}: {exc}") from exc
+
+
 class ZipFileProcessor:
-    """Simulates processing and state management of Zip files."""
+    """Simulates processing and state management of Zip files.
+
+    Can operate either directly against a PostgreSQL database via Command/Handler,
+    or on explicit file paths/state file for standalone simulation.
+    """
 
     def __init__(
         self,
         min_delay: float = 2.0,
         max_delay: float = 5.0,
         state_file: str | Path | None = None,
+        db_conn: Any | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         if min_delay < 0 or max_delay < 0:
@@ -51,6 +92,7 @@ class ZipFileProcessor:
         self.min_delay = min_delay
         self.max_delay = max_delay
         self.state_file = Path(state_file) if state_file else None
+        self.db_conn = db_conn
         self.logger = logger or setup_logger()
         self.state: dict[str, dict[str, str | float]] = {}
         if self.state_file and self.state_file.exists():
@@ -75,7 +117,7 @@ class ZipFileProcessor:
             self.logger.error("Failed to save state to %s: %s", self.state_file, e)
 
     def mark_as_processed(self, file_path_str: str, duration: float) -> None:
-        """Simulates marking a file as processed in state management."""
+        """Simulates marking a file as processed in local state management."""
         record = {
             "status": "COMPLETED",
             "processed_at": datetime.now(timezone.utc).isoformat(),
@@ -110,10 +152,7 @@ class ZipFileProcessor:
         return True
 
     def process_all(self, files: Sequence[str]) -> int:
-        """Processes a list of files sequentially.
-
-        Returns the number of processed files.
-        """
+        """Processes a list of files sequentially."""
         if not files:
             self.logger.info("No files provided to process.")
             return 0
@@ -128,16 +167,44 @@ class ZipFileProcessor:
         self.logger.info("All %d file(s) processed successfully.", processed_count)
         return processed_count
 
+    def process_from_database(
+        self,
+        conn: Any | None = None,
+        limit: int | None = None,
+        delay: float | None = None,
+    ) -> int:
+        """Queries the database for unprocessed files and processes them via Command/Handler."""
+        connection = conn or self.db_conn
+        if connection is None:
+            raise ValueError("No database connection available for database-driven processing.")
+
+        handler = ProcessUnprocessedZipFilesHandler(connection, logger=self.logger)
+        command = ProcessUnprocessedZipFilesCommand(
+            min_delay=self.min_delay,
+            max_delay=self.max_delay,
+            delay=delay,
+            limit=limit,
+        )
+        summary = handler.execute(command)
+        return summary.processed_count
+
 
 def parse_args(args: Sequence[str] | None = None) -> argparse.Namespace:
     """Parses command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Standalone Zip File Processor Service (Simulated Workflow).",
+        description="Standalone Database-Driven Zip File Processor Service (Simulated Workflow).",
     )
     parser.add_argument(
         "files",
-        nargs="+",
-        help="One or more zip file paths or identifiers to process.",
+        nargs="*",
+        default=[],
+        help="Optional zip file paths or identifiers to process directly without DB.",
+    )
+    parser.add_argument(
+        "--db-url",
+        type=str,
+        default=None,
+        help="Database URL to connect to (e.g. postgresql://... or sqlite://...).",
     )
     parser.add_argument(
         "--min-delay",
@@ -156,6 +223,12 @@ def parse_args(args: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Fixed simulated processing delay in seconds (overrides min/max delay if set).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of unprocessed database records to process.",
     )
     parser.add_argument(
         "--state-file",
@@ -185,14 +258,42 @@ def main(args: Sequence[str] | None = None) -> int:
         logger.error("Invalid arguments: min-delay (%.2f) cannot exceed max-delay (%.2f).", min_delay, max_delay)
         return 1
 
-    processor = ZipFileProcessor(
-        min_delay=min_delay,
-        max_delay=max_delay,
-        state_file=parsed.state_file,
-        logger=logger,
-    )
-    processor.process_all(parsed.files)
-    return 0
+    # If explicit files are provided via CLI arguments, process them directly
+    if parsed.files:
+        processor = ZipFileProcessor(
+            min_delay=min_delay,
+            max_delay=max_delay,
+            state_file=parsed.state_file,
+            logger=logger,
+        )
+        processor.process_all(parsed.files)
+        return 0
+
+    # Otherwise, connect to PostgreSQL and process unprocessed records from file_ingestions
+    logger.info("Initializing database-driven zip file processor...")
+    conn = None
+    try:
+        conn = get_db_connection(parsed.db_url)
+        processor = ZipFileProcessor(
+            min_delay=min_delay,
+            max_delay=max_delay,
+            db_conn=conn,
+            logger=logger,
+        )
+        processor.process_from_database(
+            limit=parsed.limit,
+            delay=parsed.delay,
+        )
+        return 0
+    except Exception as e:
+        logger.error("Database processing failed: %s", e)
+        return 1
+    finally:
+        if conn is not None and hasattr(conn, "close"):
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

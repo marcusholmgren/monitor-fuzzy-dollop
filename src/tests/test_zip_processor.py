@@ -1,10 +1,15 @@
 import json
 import logging
-from unittest.mock import patch
+import sqlite3
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
-from src.zip_processor import ZipFileProcessor, main, parse_args, setup_logger
+from src.domain.commands import ProcessUnprocessedZipFilesCommand, UpdateFileIngestionStatusCommand
+from src.domain.models import FileIngestionRecord
+from src.handlers.process_zip_files import ProcessUnprocessedZipFilesHandler, UpdateFileIngestionStatusHandler
+from src.zip_processor import ZipFileProcessor, get_db_connection, main, parse_args, setup_logger
 
 
 def test_parse_args_defaults():
@@ -13,23 +18,35 @@ def test_parse_args_defaults():
     assert args.min_delay == 2.0
     assert args.max_delay == 5.0
     assert args.delay is None
+    assert args.limit is None
     assert args.state_file is None
     assert args.log_level == "INFO"
+
+
+def test_parse_args_no_files_db_defaults():
+    args = parse_args([])
+    assert args.files == []
+    assert args.db_url is None
+    assert args.limit is None
 
 
 def test_parse_args_custom():
     args = parse_args([
         "archive.zip",
+        "--db-url", "postgresql://user:pass@localhost:5432/test",
         "--min-delay", "1.5",
         "--max-delay", "3.0",
         "--delay", "2.5",
+        "--limit", "10",
         "--state-file", "/tmp/state.json",
         "--log-level", "DEBUG",
     ])
     assert args.files == ["archive.zip"]
+    assert args.db_url == "postgresql://user:pass@localhost:5432/test"
     assert args.min_delay == 1.5
     assert args.max_delay == 3.0
     assert args.delay == 2.5
+    assert args.limit == 10
     assert args.state_file == "/tmp/state.json"
     assert args.log_level == "DEBUG"
 
@@ -125,7 +142,7 @@ def test_load_existing_state(tmp_path):
     assert "new.zip" in disk_data
 
 
-def test_main_cli_execution(tmp_path, capsys):
+def test_main_cli_execution_files(tmp_path, capsys):
     state_file = tmp_path / "state.json"
     with patch("time.sleep"):
         exit_code = main([
@@ -147,3 +164,161 @@ def test_main_cli_execution(tmp_path, capsys):
 def test_main_cli_invalid_delay_range():
     exit_code = main(["file.zip", "--min-delay", "5.0", "--max-delay", "2.0"])
     assert exit_code == 1
+
+
+# --- Database-Driven Processor Unit & Integration Tests ---
+
+@pytest.fixture
+def sqlite_db():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""
+        CREATE TABLE file_ingestions (
+            id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            original_filename TEXT NOT NULL,
+            file_size_bytes INTEGER NOT NULL,
+            file_count INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-11-01 00:00:00'
+        );
+    """)
+    conn.commit()
+    return conn
+
+
+def test_database_driven_handlers_with_sqlite(sqlite_db, caplog):
+    record_id = uuid4()
+    device_id = uuid4()
+    file_hash = "a" * 64
+
+    sqlite_db.execute(
+        """
+        INSERT INTO file_ingestions (id, device_id, file_hash, file_path, original_filename, file_size_bytes, file_count, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending');
+        """,
+        (str(record_id), str(device_id), file_hash, "/storage/sample.zip", "sample.zip", 1024, 2),
+    )
+    sqlite_db.commit()
+
+    logger = setup_logger("INFO")
+    handler = ProcessUnprocessedZipFilesHandler(sqlite_db, logger=logger)
+
+    with caplog.at_level(logging.INFO), patch("time.sleep") as mock_sleep:
+        cmd = ProcessUnprocessedZipFilesCommand(min_delay=2.0, max_delay=2.0)
+        summary = handler.execute(cmd)
+        mock_sleep.assert_called_once_with(2.0)
+
+    assert summary.total_found == 1
+    assert summary.processed_count == 1
+    assert len(summary.processed_records) == 1
+    assert summary.processed_records[0].id == record_id
+    assert summary.processed_records[0].device_id == device_id
+    assert summary.processed_records[0].file_hash == file_hash
+
+    # Verify status changed in database
+    cur = sqlite_db.cursor()
+    cur.execute("SELECT status FROM file_ingestions WHERE id = ?", (str(record_id),))
+    row = cur.fetchone()
+    assert row[0] == "processed"
+
+    # Verify log messages
+    logs = caplog.text
+    assert f"Found 1 unprocessed pending file record(s)" in logs
+    assert f"Processing file ID [{record_id}] for Device [{device_id}]" in logs
+    assert f"Completed simulated processing for file ID [{record_id}]" in logs
+    assert f"Successfully updated status to 'processed'" in logs
+
+
+def test_database_driven_empty_queue(sqlite_db, caplog):
+    logger = setup_logger("INFO")
+    handler = ProcessUnprocessedZipFilesHandler(sqlite_db, logger=logger)
+    with caplog.at_level(logging.INFO):
+        summary = handler.execute(ProcessUnprocessedZipFilesCommand(min_delay=1.0, max_delay=1.0))
+
+    assert summary.total_found == 0
+    assert summary.processed_count == 0
+    assert "No unprocessed zip files found in database" in caplog.text
+
+
+def test_database_processor_via_mock_psycopg_connection(caplog):
+    record_id = uuid4()
+    device_id = uuid4()
+    file_hash = "b" * 64
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    # Simulate fetch_unprocessed_records returning one record
+    mock_cursor.fetchall.return_value = [
+        (
+            record_id,
+            device_id,
+            file_hash,
+            "/storage/file.zip",
+            "file.zip",
+            2048,
+            3,
+            "pending",
+            {"test": "val"},
+            "2026-11-01T12:00:00Z",
+        )
+    ]
+    mock_cursor.rowcount = 1
+
+    processor = ZipFileProcessor(min_delay=2.0, max_delay=2.0, db_conn=mock_conn)
+
+    with caplog.at_level(logging.INFO), patch("time.sleep") as mock_sleep:
+        count = processor.process_from_database(delay=2.5)
+        mock_sleep.assert_called_once_with(2.5)
+
+    assert count == 1
+    # Check UPDATE query execution
+    executed_queries = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert any("UPDATE file_ingestions" in q for q in executed_queries)
+    assert any("status = %(status)s" in q for q in executed_queries)
+
+
+def test_main_cli_database_driven(tmp_path, capsys):
+    db_file = tmp_path / "test.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute("""
+        CREATE TABLE file_ingestions (
+            id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            original_filename TEXT NOT NULL,
+            file_size_bytes INTEGER NOT NULL,
+            file_count INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            metadata TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT '2026-11-01 00:00:00'
+        );
+    """)
+    record_id = uuid4()
+    device_id = uuid4()
+    conn.execute(
+        "INSERT INTO file_ingestions (id, device_id, file_hash, file_path, original_filename, file_size_bytes, file_count, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+        (str(record_id), str(device_id), "c" * 64, "/path.zip", "test.zip", 500, 1),
+    )
+    conn.commit()
+    conn.close()
+
+    with patch("time.sleep"):
+        exit_code = main([
+            "--db-url", f"sqlite:///{db_file}",
+            "--delay", "1.0",
+        ])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Initializing database-driven zip file processor" in captured.out
+    assert "DATABASE_QUERY: Found 1 unprocessed pending file record(s)" in captured.out
+    assert "PROCESSING_START" in captured.out
+    assert "PROCESSING_COMPLETE" in captured.out
+    assert "TRANSACTION: Successfully updated status to 'processed'" in captured.out
+    assert "SUMMARY: Successfully processed and updated 1/1 file(s)" in captured.out
