@@ -65,6 +65,7 @@ CREATE TABLE file_ingestions (
     original_filename VARCHAR(255) NOT NULL,
     file_size_bytes BIGINT NOT NULL,
     file_count INT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
 
     -- Idempotency key: identical payload from the same device
@@ -73,3 +74,6 @@ CREATE TABLE file_ingestions (
 
 CREATE INDEX idx_file_ingestions_lookup
     ON file_ingestions (device_id, file_hash);
+
+CREATE INDEX idx_file_ingestions_status
+    ON file_ingestions (status);

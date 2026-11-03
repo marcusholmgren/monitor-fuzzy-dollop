@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 from uuid import UUID
 
 
@@ -18,9 +19,6 @@ class IngestReadingsBatchCommand:
     items: list[ReadingItem]
 
 
-from pathlib import Path
-
-
 @dataclass(frozen=True, slots=True)
 class IngestZipFileCommand:
     device_id: UUID
@@ -28,3 +26,19 @@ class IngestZipFileCommand:
     filename: str
     content_stream: Any  # SpooledTemporaryFile from UploadFile
     storage_root: Path
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateFileIngestionStatusCommand:
+    id: UUID
+    device_id: UUID
+    file_hash: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessUnprocessedZipFilesCommand:
+    min_delay: float = 2.0
+    max_delay: float = 5.0
+    delay: Optional[float] = None
+    limit: Optional[int] = None
